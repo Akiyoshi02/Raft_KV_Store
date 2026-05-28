@@ -1,0 +1,59 @@
+services:
+  node1:
+    build: .
+    container_name: raft-node1
+    command:
+      - "-id"    
+      - "node1"
+      - "-addr"  
+      - "0.0.0.0:8001"
+      - "-peers" 
+      - "node2:8002,node3:8003"
+      - "-data"  
+      - "/data"
+    ports:
+      - "8001:8001"
+    volumes:
+      - node1-data:/data
+    restart: on-failure
+
+  node2:
+    build: .
+    container_name: raft-node2
+    command:
+      - "-id"    
+      - "node2"
+      - "-addr"  
+      - "0.0.0.0:8002"
+      - "-peers" 
+      - "node1:8001,node3:8003"
+      - "-data"  
+      - "/data"
+    ports:
+      - "8002:8002"
+    volumes:
+      - node2-data:/data
+    restart: on-failure
+
+  node3:
+    build: .
+    container_name: raft-node3
+    command:
+      - "-id"    
+      - "node3"
+      - "-addr"  
+      - "0.0.0.0:8003"
+      - "-peers" 
+      - "node1:8001,node2:8002"
+      - "-data"  
+      - "/data"
+    ports:
+      - "8003:8003"
+    volumes:
+      - node3-data:/data
+    restart: on-failure
+
+volumes:
+  node1-data:
+  node2-data:
+  node3-data:
