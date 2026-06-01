@@ -1,0 +1,6 @@
+.git
+.gitignore
+/cli
+/cli.exe
+/server
+/server.exe

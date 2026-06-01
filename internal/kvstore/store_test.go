@@ -64,3 +64,13 @@ func TestGetAll(t *testing.T) {
 		t.Fatalf("expected 3 entries, got %d", len(all))
 	}
 }
+
+func TestEmptyKeyRejected(t *testing.T) {
+	s := New()
+	if err := s.Apply("SET  value"); err == nil {
+		t.Fatal("expected SET with an empty key to fail")
+	}
+	if err := s.Apply("DELETE "); err == nil {
+		t.Fatal("expected DELETE with an empty key to fail")
+	}
+}

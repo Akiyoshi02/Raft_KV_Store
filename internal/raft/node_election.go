@@ -10,14 +10,27 @@ import (
 // startElection begins a new leader election.
 // Called when the election timer fires — meaning we haven't heard from
 // a leader and we're going to try to become one ourselves.
-func (n *Node) startElection() {
+func (n *Node) startElection(generation uint64) {
 	n.mu.Lock()
+
+	// Ignore an expired timer callback if a heartbeat reset the timer while
+	// the callback was waiting to acquire the lock.
+	if generation != n.electionGen || n.state == Leader {
+		n.mu.Unlock()
+		return
+	}
 
 	n.state = Candidate
 	n.currentTerm++
 	n.votedFor = n.config.NodeID // vote for ourselves
 	n.leaderID = ""
-	n.savePersistentState()
+	if err := n.savePersistentState(); err != nil {
+		slog.Error("failed to persist election state", "id", n.config.NodeID, "error", err)
+		n.state = Follower
+		n.resetElectionTimer()
+		n.mu.Unlock()
+		return
+	}
 	n.resetElectionTimer() // reset in case this election also times out
 
 	term := n.currentTerm
@@ -32,6 +45,18 @@ func (n *Node) startElection() {
 	votes := 1 // we vote for ourselves
 	majority := (len(peers)+1)/2 + 1
 	var votesMu sync.Mutex
+
+	if votes >= majority {
+		n.mu.Lock()
+		if n.state == Candidate && n.currentTerm == term {
+			if err := n.becomeLeader(); err != nil {
+				slog.Error("failed to become leader", "id", n.config.NodeID, "error", err)
+			}
+		}
+		n.mu.Unlock()
+		n.replicateToAll()
+		return
+	}
 
 	for _, peer := range peers {
 		go func(peer string) {
@@ -52,7 +77,9 @@ func (n *Node) startElection() {
 
 			// If we see a higher term, step down immediately
 			if reply.Term > n.currentTerm {
-				n.becomeFollower(reply.Term, "")
+				if err := n.becomeFollower(reply.Term, ""); err != nil {
+					slog.Error("failed to persist higher term", "term", reply.Term, "error", err)
+				}
 				return
 			}
 
@@ -68,7 +95,9 @@ func (n *Node) startElection() {
 				votesMu.Unlock()
 
 				if currentVotes >= majority && n.state == Candidate {
-					n.becomeLeader()
+					if err := n.becomeLeader(); err != nil {
+						slog.Error("failed to become leader", "id", n.config.NodeID, "error", err)
+					}
 					go n.replicateToAll() // send immediate heartbeats to assert leadership
 				}
 			}
@@ -91,7 +120,11 @@ func (n *Node) HandleRequestVote(args RequestVoteArgs) RequestVoteReply {
 
 	// Rule 2: if we see a higher term, update and step down
 	if args.Term > n.currentTerm {
-		n.becomeFollower(args.Term, "")
+		if err := n.becomeFollower(args.Term, ""); err != nil {
+			slog.Error("failed to persist vote request term", "term", args.Term, "error", err)
+			reply.Term = n.currentTerm
+			return reply
+		}
 	}
 
 	// Rule 3: only vote if we haven't voted yet this term (or already
@@ -103,8 +136,14 @@ func (n *Node) HandleRequestVote(args RequestVoteArgs) RequestVoteReply {
 			args.LastLogIndex >= n.raftLog.LastIndex())
 
 	if canVote && logOk {
+		previousVote := n.votedFor
 		n.votedFor = args.CandidateID
-		n.savePersistentState()
+		if err := n.savePersistentState(); err != nil {
+			n.votedFor = previousVote
+			slog.Error("failed to persist vote", "to", args.CandidateID, "term", args.Term, "error", err)
+			reply.Term = n.currentTerm
+			return reply
+		}
 		n.resetElectionTimer() // hearing from a valid candidate resets our timer
 		reply.VoteGranted = true
 		slog.Info("granted vote", "to", args.CandidateID, "term", args.Term)

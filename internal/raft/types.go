@@ -75,7 +75,11 @@ type Config struct {
 // Timing constants that control election and heartbeat behaviour.
 // These values follow the recommendations in the Raft paper.
 const (
-	HeartbeatInterval  = 50 * time.Millisecond
-	ElectionTimeoutMin = 150 * time.Millisecond
-	ElectionTimeoutMax = 300 * time.Millisecond
+	HeartbeatInterval  = 100 * time.Millisecond
+	ElectionTimeoutMin = 750 * time.Millisecond
+	ElectionTimeoutMax = 1500 * time.Millisecond
+	StartupTimeoutMin  = 3 * time.Second
+	StartupTimeoutMax  = 4500 * time.Millisecond
+	RaftRPCTimeout     = 500 * time.Millisecond
+	SubmitTimeout      = 2 * time.Second
 )

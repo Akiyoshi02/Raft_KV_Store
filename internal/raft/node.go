@@ -11,7 +11,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Akiyoshi02/raft-kv-store/internal/kvstore"
+	"github.com/Akiyoshi02/Raft_KV_Store/internal/kvstore"
 )
 
 // persistentState holds fields that must survive a crash.
@@ -19,6 +19,7 @@ import (
 type persistentState struct {
 	CurrentTerm int    `json:"current_term"`
 	VotedFor    string `json:"voted_for"`
+	CommitIndex int    `json:"commit_index"`
 }
 
 // Node is a single member of the Raft cluster.
@@ -31,7 +32,8 @@ type Node struct {
 	currentTerm int
 	votedFor    string // NodeID we voted for this term, "" if none
 
-	// Volatile state on all nodes
+	// State tracked on all nodes. commitIndex is persisted so the in-memory
+	// store can be rebuilt safely after restart.
 	commitIndex int       // highest log entry known to be committed
 	lastApplied int       // highest log entry applied to the KV store
 	state       NodeState // current role: Follower, Candidate, or Leader
@@ -49,9 +51,12 @@ type Node struct {
 	// Timers
 	electionTimer  *time.Timer
 	heartbeatTimer *time.Timer
+	electionGen    uint64
 
 	// Lifecycle
-	stopCh chan struct{}
+	stopCh   chan struct{}
+	stopOnce sync.Once
+	stateCh  chan struct{}
 }
 
 // NewNode creates a Raft node. It loads any existing persistent state
@@ -72,13 +77,18 @@ func NewNode(config Config, store *kvstore.Store) (*Node, error) {
 		state:      Follower,
 		raftLog:    raftLog,
 		store:      store,
-		httpClient: &http.Client{Timeout: 50 * time.Millisecond},
+		httpClient: &http.Client{Timeout: RaftRPCTimeout},
 		stopCh:     make(chan struct{}),
+		stateCh:    make(chan struct{}),
 	}
 
 	if err := n.loadPersistentState(); err != nil {
 		raftLog.Close()
 		return nil, fmt.Errorf("load persistent state: %w", err)
+	}
+	if err := n.applyCommitted(); err != nil {
+		raftLog.Close()
+		return nil, fmt.Errorf("replay committed entries: %w", err)
 	}
 
 	return n, nil
@@ -87,33 +97,46 @@ func NewNode(config Config, store *kvstore.Store) (*Node, error) {
 // Start begins the node's operation by arming the election timer.
 func (n *Node) Start() {
 	n.mu.Lock()
-	n.resetElectionTimer()
+	if len(n.config.Peers) == 0 {
+		n.resetElectionTimer()
+	} else {
+		n.resetStartupTimer()
+	}
 	n.mu.Unlock()
 	slog.Info("node started", "id", n.config.NodeID, "address", n.config.Address)
 }
 
 // Stop shuts the node down cleanly.
 func (n *Node) Stop() {
-	close(n.stopCh)
-	n.mu.Lock()
-	if n.electionTimer != nil {
-		n.electionTimer.Stop()
-	}
-	if n.heartbeatTimer != nil {
-		n.heartbeatTimer.Stop()
-	}
-	n.mu.Unlock()
-	n.raftLog.Close()
-	slog.Info("node stopped", "id", n.config.NodeID)
+	n.stopOnce.Do(func() {
+		close(n.stopCh)
+		n.mu.Lock()
+		if n.electionTimer != nil {
+			n.electionTimer.Stop()
+		}
+		if n.heartbeatTimer != nil {
+			n.heartbeatTimer.Stop()
+		}
+		n.notifyStateChange()
+		n.mu.Unlock()
+		if err := n.raftLog.Close(); err != nil {
+			slog.Error("failed to close raft log", "id", n.config.NodeID, "error", err)
+		}
+		slog.Info("node stopped", "id", n.config.NodeID)
+	})
 }
 
 // Submit accepts a write command from a client.
 // Only the leader can accept writes — returns an error if this node is not the leader.
 func (n *Node) Submit(command string) error {
+	if err := kvstore.Validate(command); err != nil {
+		return fmt.Errorf("invalid command: %w", err)
+	}
+
 	n.mu.Lock()
-	defer n.mu.Unlock()
 
 	if n.state != Leader {
+		n.mu.Unlock()
 		return fmt.Errorf("not leader: current leader is %q", n.leaderID)
 	}
 
@@ -123,12 +146,48 @@ func (n *Node) Submit(command string) error {
 		Command: command,
 	}
 	if err := n.raftLog.Append(entry); err != nil {
+		n.mu.Unlock()
 		return fmt.Errorf("append to log: %w", err)
 	}
 
 	slog.Info("submitted entry", "index", entry.Index, "command", command)
-	go n.replicateToAll()
-	return nil
+	if err := n.updateCommitIndex(); err != nil {
+		n.mu.Unlock()
+		return err
+	}
+	if n.commitIndex >= entry.Index {
+		n.mu.Unlock()
+		return nil
+	}
+
+	stateCh := n.stateCh
+	n.mu.Unlock()
+	n.replicateToAll()
+
+	timer := time.NewTimer(SubmitTimeout)
+	defer timer.Stop()
+
+	for {
+		select {
+		case <-stateCh:
+			n.mu.Lock()
+			if n.commitIndex >= entry.Index {
+				n.mu.Unlock()
+				return nil
+			}
+			if n.state != Leader {
+				leaderID := n.leaderID
+				n.mu.Unlock()
+				return fmt.Errorf("leadership lost before entry %d committed: current leader is %q", entry.Index, leaderID)
+			}
+			stateCh = n.stateCh
+			n.mu.Unlock()
+		case <-timer.C:
+			return fmt.Errorf("entry %d was not committed before timeout", entry.Index)
+		case <-n.stopCh:
+			return fmt.Errorf("node stopped before entry %d committed", entry.Index)
+		}
+	}
 }
 
 // GetState returns the node's current state and term. Safe for concurrent use.
@@ -165,28 +224,46 @@ func (n *Node) GetValue(key string) (string, bool) {
 // votedFor is only cleared when the term increases — within the same term
 // we must remember who we voted for.
 // Must be called with n.mu held.
-func (n *Node) becomeFollower(term int, leaderID string) {
+func (n *Node) becomeFollower(term int, leaderID string) error {
+	var persistErr error
 	if term > n.currentTerm {
 		slog.Info("stepping down to follower", "id", n.config.NodeID,
 			"old_term", n.currentTerm, "new_term", term)
 		n.currentTerm = term
 		n.votedFor = ""
-		n.savePersistentState()
+		if err := n.savePersistentState(); err != nil {
+			persistErr = err
+		}
 	}
 	n.state = Follower
 	n.leaderID = leaderID
+	n.notifyStateChange()
 	n.resetElectionTimer()
+	return persistErr
 }
 
 // becomeLeader transitions the node to leader after winning an election.
 // Must be called with n.mu held.
-func (n *Node) becomeLeader() {
+func (n *Node) becomeLeader() error {
 	if n.state != Candidate {
-		return // guard against duplicate becomeLeader calls
+		return nil // guard against duplicate becomeLeader calls
 	}
 	slog.Info("became leader", "id", n.config.NodeID, "term", n.currentTerm)
 	n.state = Leader
 	n.leaderID = n.config.NodeID
+	n.notifyStateChange()
+
+	// Commit a current-term no-op entry after election. This lets the leader
+	// safely commit any inherited entries from older terms without waiting for
+	// a client write.
+	entry := LogEntry{Index: n.raftLog.LastIndex() + 1, Term: n.currentTerm}
+	if err := n.raftLog.Append(entry); err != nil {
+		n.state = Follower
+		n.leaderID = ""
+		n.notifyStateChange()
+		n.resetElectionTimer()
+		return fmt.Errorf("append leader no-op entry: %w", err)
+	}
 
 	// Initialise per-peer tracking indices
 	n.nextIndex = make(map[string]int)
@@ -200,7 +277,15 @@ func (n *Node) becomeLeader() {
 	if n.electionTimer != nil {
 		n.electionTimer.Stop()
 	}
+	if err := n.updateCommitIndex(); err != nil {
+		n.state = Follower
+		n.leaderID = ""
+		n.notifyStateChange()
+		n.resetElectionTimer()
+		return err
+	}
 	n.resetHeartbeatTimer()
+	return nil
 }
 
 // ── Timers ────────────────────────────────────────────────────────────────────
@@ -210,12 +295,27 @@ func (n *Node) becomeLeader() {
 // elections simultaneously and nobody would ever win.
 // Must be called with n.mu held.
 func (n *Node) resetElectionTimer() {
+	n.resetElectionTimerBetween(ElectionTimeoutMin, ElectionTimeoutMax)
+}
+
+// resetStartupTimer gives a multi-node process time to become reachable after
+// startup before it campaigns. Once cluster traffic arrives, the regular
+// election timeout is used so leader failover remains fast.
+func (n *Node) resetStartupTimer() {
+	n.resetElectionTimerBetween(StartupTimeoutMin, StartupTimeoutMax)
+}
+
+func (n *Node) resetElectionTimerBetween(minimum, maximum time.Duration) {
 	if n.electionTimer != nil {
 		n.electionTimer.Stop()
 	}
-	jitter := time.Duration(rand.Int63n(int64(ElectionTimeoutMax - ElectionTimeoutMin)))
-	timeout := ElectionTimeoutMin + jitter
-	n.electionTimer = time.AfterFunc(timeout, n.onElectionTimeout)
+	n.electionGen++
+	generation := n.electionGen
+	jitter := time.Duration(rand.Int63n(int64(maximum - minimum)))
+	timeout := minimum + jitter
+	n.electionTimer = time.AfterFunc(timeout, func() {
+		n.onElectionTimeout(generation)
+	})
 }
 
 // resetHeartbeatTimer arms the periodic heartbeat for the leader.
@@ -227,12 +327,12 @@ func (n *Node) resetHeartbeatTimer() {
 	n.heartbeatTimer = time.AfterFunc(HeartbeatInterval, n.onHeartbeatTimeout)
 }
 
-func (n *Node) onElectionTimeout() {
+func (n *Node) onElectionTimeout(generation uint64) {
 	select {
 	case <-n.stopCh:
 		return
 	default:
-		n.startElection()
+		n.startElection(generation)
 	}
 }
 
@@ -257,11 +357,21 @@ func (n *Node) onHeartbeatTimeout() {
 // updateCommitIndex advances commitIndex when a majority of nodes have
 // replicated an entry. Only the leader calls this.
 // Must be called with n.mu held.
-func (n *Node) updateCommitIndex() {
+func (n *Node) updateCommitIndex() error {
 	lastIndex := n.raftLog.LastIndex()
 	clusterSize := len(n.config.Peers) + 1
 
-	for candidate := n.commitIndex + 1; candidate <= lastIndex; candidate++ {
+	for candidate := lastIndex; candidate > n.commitIndex; candidate-- {
+		entry, err := n.raftLog.GetEntry(candidate)
+		if err != nil {
+			return err
+		}
+		// Raft safety rule: advance through an entry from the current term.
+		// Earlier entries become committed implicitly when this succeeds.
+		if entry.Term != n.currentTerm {
+			continue
+		}
+
 		// Count nodes that have this entry (self counts as 1)
 		count := 1
 		for _, matchIdx := range n.matchIndex {
@@ -269,49 +379,79 @@ func (n *Node) updateCommitIndex() {
 				count++
 			}
 		}
-		entry, err := n.raftLog.GetEntry(candidate)
-		if err != nil {
-			break
-		}
-		// Raft safety rule: only commit entries from the current term
-		if count > clusterSize/2 && entry.Term == n.currentTerm {
+		if count > clusterSize/2 {
+			oldCommitIndex := n.commitIndex
 			n.commitIndex = candidate
+			if err := n.savePersistentState(); err != nil {
+				n.commitIndex = oldCommitIndex
+				return fmt.Errorf("persist commit index: %w", err)
+			}
+			n.notifyStateChange()
 			slog.Info("entry committed", "index", candidate, "command", entry.Command)
-		} else {
 			break
 		}
 	}
-	n.applyCommitted()
+	return n.applyCommitted()
 }
 
 // applyCommitted applies all committed-but-not-yet-applied entries to the KV store.
 // Must be called with n.mu held.
-func (n *Node) applyCommitted() {
+func (n *Node) applyCommitted() error {
 	for n.lastApplied < n.commitIndex {
-		n.lastApplied++
-		entry, err := n.raftLog.GetEntry(n.lastApplied)
+		nextIndex := n.lastApplied + 1
+		entry, err := n.raftLog.GetEntry(nextIndex)
 		if err != nil {
-			slog.Error("failed to read log entry", "index", n.lastApplied, "error", err)
-			continue
+			return fmt.Errorf("read log entry %d: %w", nextIndex, err)
 		}
 		if entry.Command == "" {
+			n.lastApplied = nextIndex
 			continue // dummy entry at index 0
 		}
 		if err := n.store.Apply(entry.Command); err != nil {
-			slog.Error("failed to apply command", "command", entry.Command, "error", err)
-		} else {
-			slog.Info("applied to store", "index", n.lastApplied, "command", entry.Command)
+			return fmt.Errorf("apply command at index %d: %w", nextIndex, err)
 		}
+		n.lastApplied = nextIndex
+		slog.Info("applied to store", "index", n.lastApplied, "command", entry.Command)
 	}
+	return nil
 }
 
 // ── Persistence ───────────────────────────────────────────────────────────────
 
-func (n *Node) savePersistentState() {
+func (n *Node) notifyStateChange() {
+	close(n.stateCh)
+	n.stateCh = make(chan struct{})
+}
+
+func (n *Node) savePersistentState() error {
 	state := persistentState{CurrentTerm: n.currentTerm, VotedFor: n.votedFor}
-	data, _ := json.Marshal(state)
+	state.CommitIndex = n.commitIndex
+	data, err := json.Marshal(state)
+	if err != nil {
+		return fmt.Errorf("marshal persistent state: %w", err)
+	}
 	path := filepath.Join(n.config.DataDir, "state.json")
-	os.WriteFile(path, data, 0644)
+	file, err := os.CreateTemp(n.config.DataDir, "state-*.tmp")
+	if err != nil {
+		return fmt.Errorf("create temporary persistent state: %w", err)
+	}
+	tempPath := file.Name()
+	defer os.Remove(tempPath)
+	if _, err := file.Write(data); err != nil {
+		file.Close()
+		return fmt.Errorf("write persistent state: %w", err)
+	}
+	if err := file.Sync(); err != nil {
+		file.Close()
+		return fmt.Errorf("sync persistent state: %w", err)
+	}
+	if err := file.Close(); err != nil {
+		return fmt.Errorf("close persistent state: %w", err)
+	}
+	if err := os.Rename(tempPath, path); err != nil {
+		return fmt.Errorf("replace persistent state: %w", err)
+	}
+	return nil
 }
 
 func (n *Node) loadPersistentState() error {
@@ -329,6 +469,10 @@ func (n *Node) loadPersistentState() error {
 	}
 	n.currentTerm = state.CurrentTerm
 	n.votedFor = state.VotedFor
+	if state.CommitIndex < 0 || state.CommitIndex > n.raftLog.LastIndex() {
+		return fmt.Errorf("commit index %d exceeds log length %d", state.CommitIndex, n.raftLog.LastIndex())
+	}
+	n.commitIndex = state.CommitIndex
 	return nil
 }
 

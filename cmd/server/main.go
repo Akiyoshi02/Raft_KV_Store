@@ -2,17 +2,19 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"strings"
 	"syscall"
 	"time"
 
-	"github.com/Akiyoshi02/raft-kv-store/internal/kvstore"
-	"github.com/Akiyoshi02/raft-kv-store/internal/raft"
-	"github.com/Akiyoshi02/raft-kv-store/internal/server"
+	"github.com/Akiyoshi02/Raft_KV_Store/internal/kvstore"
+	"github.com/Akiyoshi02/Raft_KV_Store/internal/raft"
+	"github.com/Akiyoshi02/Raft_KV_Store/internal/server"
 )
 
 func main() {
@@ -29,7 +31,11 @@ func main() {
 
 	var peers []string
 	if *peersStr != "" {
-		peers = strings.Split(*peersStr, ",")
+		for _, peer := range strings.Split(*peersStr, ",") {
+			if peer = strings.TrimSpace(peer); peer != "" {
+				peers = append(peers, peer)
+			}
+		}
 	}
 
 	cfg := raft.Config{
@@ -51,23 +57,35 @@ func main() {
 
 	node.Start()
 
-	// Run the HTTP server in the background
+	serverErr := make(chan error, 1)
 	go func() {
-		if err := srv.Start(); err != nil {
-			slog.Info("HTTP server stopped", "reason", err)
-		}
+		serverErr <- srv.Start()
 	}()
 
 	slog.Info("node is running", "id", *nodeID, "address", *address, "peers", peers)
 
-	// Block until Ctrl+C or SIGTERM
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, os.Interrupt, syscall.SIGTERM)
-	<-quit
 
-	slog.Info("shutting down gracefully...")
+	exitCode := 0
+	select {
+	case <-quit:
+		slog.Info("shutting down gracefully...")
+	case err := <-serverErr:
+		if !errors.Is(err, http.ErrServerClosed) {
+			slog.Error("HTTP server stopped unexpectedly", "reason", err)
+			exitCode = 1
+		}
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	srv.Stop(ctx)
+	if err := srv.Stop(ctx); err != nil {
+		slog.Error("failed to stop HTTP server gracefully", "error", err)
+		exitCode = 1
+	}
 	node.Stop()
+	if exitCode != 0 {
+		os.Exit(exitCode)
+	}
 }

@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"encoding/json"
 	"log/slog"
+
+	"github.com/Akiyoshi02/Raft_KV_Store/internal/kvstore"
 )
 
 // replicateToAll sends AppendEntries RPCs to every peer.
@@ -65,11 +67,13 @@ func (n *Node) replicateToPeer(peer string) {
 
 	// Step down if we see a higher term
 	if reply.Term > n.currentTerm {
-		n.becomeFollower(reply.Term, "")
+		if err := n.becomeFollower(reply.Term, ""); err != nil {
+			slog.Error("failed to persist higher term", "term", reply.Term, "error", err)
+		}
 		return
 	}
 
-	if n.state != Leader {
+	if n.state != Leader || args.Term != n.currentTerm {
 		return
 	}
 
@@ -83,7 +87,9 @@ func (n *Node) replicateToPeer(peer string) {
 			if lastSent > n.matchIndex[peer] {
 				n.matchIndex[peer] = lastSent
 			}
-			n.updateCommitIndex()
+			if err := n.updateCommitIndex(); err != nil {
+				slog.Error("failed to update commit index", "error", err)
+			}
 		}
 	} else {
 		// Log inconsistency — back up one step and retry
@@ -96,20 +102,30 @@ func (n *Node) replicateToPeer(peer string) {
 
 // HandleAppendEntries processes an incoming AppendEntries RPC.
 // Called for both heartbeats and real log entries.
-func (n *Node) HandleAppendEntries(args AppendEntriesArgs) AppendEntriesReply {
+func (n *Node) HandleAppendEntries(args AppendEntriesArgs) (reply AppendEntriesReply) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
-	reply := AppendEntriesReply{Term: n.currentTerm, Success: false}
+	reply = AppendEntriesReply{Term: n.currentTerm, Success: false}
+	defer func() {
+		reply.Term = n.currentTerm
+	}()
 
 	// Reject leaders from an older term
 	if args.Term < n.currentTerm {
 		return reply
 	}
 
+	if args.PrevLogIndex < 0 || args.LeaderCommit < 0 {
+		return reply
+	}
+
 	// Valid message from a current or newer leader — accept it
 	if args.Term > n.currentTerm || n.state != Follower {
-		n.becomeFollower(args.Term, args.LeaderID)
+		if err := n.becomeFollower(args.Term, args.LeaderID); err != nil {
+			slog.Error("failed to persist append entries term", "term", args.Term, "error", err)
+			return reply
+		}
 	} else {
 		n.leaderID = args.LeaderID
 		n.resetElectionTimer()
@@ -126,14 +142,39 @@ func (n *Node) HandleAppendEntries(args AppendEntriesArgs) AppendEntriesReply {
 		}
 	}
 
+	for i, entry := range args.Entries {
+		expectedIndex := args.PrevLogIndex + i + 1
+		if entry.Index != expectedIndex {
+			slog.Warn("rejected append entries with invalid index", "expected", expectedIndex, "actual", entry.Index)
+			return reply
+		}
+		if entry.Term < 0 || entry.Term > args.Term {
+			slog.Warn("rejected append entries with invalid term", "entry_term", entry.Term, "leader_term", args.Term)
+			return reply
+		}
+		if entry.Command != "" {
+			if err := kvstore.Validate(entry.Command); err != nil {
+				slog.Warn("rejected append entries with invalid command", "command", entry.Command, "error", err)
+				return reply
+			}
+		}
+	}
+
 	// Merge the leader's entries into our log
 	for i, newEntry := range args.Entries {
 		if newEntry.Index <= n.raftLog.LastIndex() {
 			existing, err := n.raftLog.GetEntry(newEntry.Index)
-			if err == nil && existing.Term != newEntry.Term {
+			if err == nil && (existing.Term != newEntry.Term || existing.Command != newEntry.Command) {
 				// Conflict: our entry and the leader's entry disagree at this index.
 				// Discard ours and everything after it, then append from the leader.
-				n.raftLog.TruncateFrom(newEntry.Index)
+				if newEntry.Index <= n.commitIndex {
+					slog.Error("rejected append entries that conflict with committed log", "index", newEntry.Index)
+					return reply
+				}
+				if err := n.raftLog.TruncateFrom(newEntry.Index); err != nil {
+					slog.Error("failed to truncate conflicting entries", "error", err)
+					return reply
+				}
 				if err := n.raftLog.Append(args.Entries[i:]...); err != nil {
 					slog.Error("failed to append after truncate", "error", err)
 					return reply
@@ -153,12 +194,22 @@ func (n *Node) HandleAppendEntries(args AppendEntriesArgs) AppendEntriesReply {
 	// Advance our commit index to match the leader's
 	if args.LeaderCommit > n.commitIndex {
 		lastNewIndex := n.raftLog.LastIndex()
+		oldCommitIndex := n.commitIndex
 		if args.LeaderCommit < lastNewIndex {
 			n.commitIndex = args.LeaderCommit
 		} else {
 			n.commitIndex = lastNewIndex
 		}
-		n.applyCommitted()
+		if err := n.savePersistentState(); err != nil {
+			n.commitIndex = oldCommitIndex
+			slog.Error("failed to persist follower commit index", "error", err)
+			return reply
+		}
+		n.notifyStateChange()
+	}
+	if err := n.applyCommitted(); err != nil {
+		slog.Error("failed to apply committed entries", "error", err)
+		return reply
 	}
 
 	reply.Success = true
