@@ -2,6 +2,7 @@ package raft
 
 import (
 	"os"
+	"strings"
 	"testing"
 )
 
@@ -142,5 +143,51 @@ func TestGetEntriesFrom(t *testing.T) {
 	}
 	if entries[0].Command != "SET b 2" {
 		t.Fatalf("unexpected entry: %s", entries[0].Command)
+	}
+}
+
+func TestAppendRejectsNonSequentialIndex(t *testing.T) {
+	log, cleanup := tempLog(t)
+	defer cleanup()
+
+	err := log.Append(LogEntry{Index: 2, Term: 1, Command: "SET a 1"})
+	if err == nil {
+		t.Fatal("expected append with non-sequential index to fail")
+	}
+	if log.LastIndex() != 0 {
+		t.Fatalf("expected log to remain empty, got last index %d", log.LastIndex())
+	}
+}
+
+func TestPersistenceWithLargeEntry(t *testing.T) {
+	f, err := os.CreateTemp("", "raft-log-*.log")
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	defer os.Remove(f.Name())
+
+	value := strings.Repeat("x", 128*1024)
+	log1, err := NewLog(f.Name())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := log1.Append(LogEntry{Index: 1, Term: 1, Command: "SET large " + value}); err != nil {
+		t.Fatal(err)
+	}
+	log1.Close()
+
+	log2, err := NewLog(f.Name())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer log2.Close()
+
+	entry, err := log2.GetEntry(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if entry.Command != "SET large "+value {
+		t.Fatal("large log entry did not survive reload")
 	}
 }

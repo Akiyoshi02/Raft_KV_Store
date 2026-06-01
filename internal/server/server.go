@@ -6,8 +6,9 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"time"
 
-	"github.com/Akiyoshi02/raft-kv-store/internal/raft"
+	"github.com/Akiyoshi02/Raft_KV_Store/internal/raft"
 )
 
 // Server exposes both the Raft RPC endpoints (for inter-node communication)
@@ -35,8 +36,9 @@ func New(node *raft.Node, address string) *Server {
 	mux.HandleFunc("GET /api/status", s.handleStatus)
 
 	s.httpServer = &http.Server{
-		Addr:    address,
-		Handler: mux,
+		Addr:              address,
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
 	}
 
 	return s
@@ -89,8 +91,8 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleSet(w http.ResponseWriter, r *http.Request) {
 	key := r.PathValue("key")
-	if strings.Contains(key, " ") {
-		writeJSON(w, http.StatusBadRequest, errorResponse{"key must not contain spaces"})
+	if !validKey(key) {
+		writeJSON(w, http.StatusBadRequest, errorResponse{"key must not be empty or contain spaces"})
 		return
 	}
 
@@ -112,6 +114,10 @@ func (s *Server) handleSet(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 	key := r.PathValue("key")
+	if !validKey(key) {
+		writeJSON(w, http.StatusBadRequest, errorResponse{"key must not be empty or contain spaces"})
+		return
+	}
 	command := "DELETE " + key
 	if err := s.node.Submit(command); err != nil {
 		writeJSON(w, http.StatusServiceUnavailable, errorResponse{err.Error()})
@@ -139,6 +145,10 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 
 type errorResponse struct {
 	Error string `json:"error"`
+}
+
+func validKey(key string) bool {
+	return key != "" && !strings.Contains(key, " ")
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

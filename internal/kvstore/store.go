@@ -25,26 +25,46 @@ func New() *Store {
 // This is the only way the store should ever be modified - always through
 // a committed log entry, never directly.
 func (s *Store) Apply(command string) error {
-	parts := strings.SplitN(command, " ", 3)
-	if len(parts) == 0 {
-		return fmt.Errorf("empty command")
+	operation, key, value, err := parseCommand(command)
+	if err != nil {
+		return err
 	}
 
-	switch strings.ToUpper(parts[0]) {
+	switch operation {
 	case "SET":
-		if len(parts) != 3 {
-			return fmt.Errorf("SET requires exactly a key and a value")
-		}
-		s.set(parts[1], parts[2])
+		s.set(key, value)
 	case "DELETE":
-		if len(parts) != 2 {
-			return fmt.Errorf("DELETE requires exactly a key")
-		}
-		s.delete(parts[1])
-	default:
-		return fmt.Errorf("unknown command: %s", parts[0])
+		s.delete(key)
 	}
 	return nil
+}
+
+// Validate checks whether a command can be applied without mutating the store.
+func Validate(command string) error {
+	_, _, _, err := parseCommand(command)
+	return err
+}
+
+func parseCommand(command string) (operation, key, value string, err error) {
+	parts := strings.SplitN(command, " ", 3)
+	if len(parts) == 0 || parts[0] == "" {
+		return "", "", "", fmt.Errorf("empty command")
+	}
+
+	switch operation = strings.ToUpper(parts[0]); operation {
+	case "SET":
+		if len(parts) != 3 || parts[1] == "" {
+			return "", "", "", fmt.Errorf("SET requires exactly a key and a value")
+		}
+		return operation, parts[1], parts[2], nil
+	case "DELETE":
+		if len(parts) != 2 || parts[1] == "" {
+			return "", "", "", fmt.Errorf("DELETE requires exactly a key")
+		}
+		return operation, parts[1], "", nil
+	default:
+		return "", "", "", fmt.Errorf("unknown command: %s", parts[0])
+	}
 }
 
 // Get retrieves the value for a key.

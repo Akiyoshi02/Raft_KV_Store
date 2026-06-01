@@ -1,11 +1,12 @@
 package raft
 
 import (
-	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"sync"
 )
 
@@ -49,21 +50,23 @@ func (l *Log) loadFromDisk() error {
 	if _, err := l.file.Seek(0, io.SeekStart); err != nil {
 		return err
 	}
-	scanner := bufio.NewScanner(l.file)
-	for scanner.Scan() {
-		line := scanner.Bytes()
-		if len(line) == 0 {
-			continue
-		}
+
+	decoder := json.NewDecoder(l.file)
+	expectedIndex := 1
+	for {
 		var entry LogEntry
-		if err := json.Unmarshal(line, &entry); err != nil {
+		if err := decoder.Decode(&entry); err == io.EOF {
+			break
+		} else if err != nil {
 			return fmt.Errorf("corrupt log entry: %w", err)
 		}
+		if entry.Index != expectedIndex {
+			return fmt.Errorf("corrupt log entry: expected index %d, got %d", expectedIndex, entry.Index)
+		}
 		l.entries = append(l.entries, entry)
+		expectedIndex++
 	}
-	if err := scanner.Err(); err != nil {
-		return err
-	}
+
 	// Move cursor to end so future writes append correctly
 	_, err := l.file.Seek(0, io.SeekEnd)
 	return err
@@ -75,21 +78,35 @@ func (l *Log) Append(entries ...LogEntry) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
+	if len(entries) == 0 {
+		return nil
+	}
+
+	var data bytes.Buffer
+	for i, entry := range entries {
+		expectedIndex := len(l.entries) + i
+		if entry.Index != expectedIndex {
+			return fmt.Errorf("append entry index %d: expected %d", entry.Index, expectedIndex)
+		}
+		encoded, err := json.Marshal(entry)
+		if err != nil {
+			return fmt.Errorf("marshal entry: %w", err)
+		}
+		data.Write(encoded)
+		data.WriteByte('\n')
+	}
+
 	// Seek to end before writing in case a truncation moved the cursor
 	if _, err := l.file.Seek(0, io.SeekEnd); err != nil {
 		return fmt.Errorf("seek before append: %w", err)
 	}
-
-	for _, entry := range entries {
-		data, err := json.Marshal(entry)
-		if err != nil {
-			return fmt.Errorf("marshal entry: %w", err)
-		}
-		if _, err := fmt.Fprintf(l.file, "%s\n", data); err != nil {
-			return fmt.Errorf("write to disk: %w", err)
-		}
-		l.entries = append(l.entries, entry)
+	if _, err := l.file.Write(data.Bytes()); err != nil {
+		return fmt.Errorf("write to disk: %w", err)
 	}
+	if err := l.file.Sync(); err != nil {
+		return fmt.Errorf("sync log file: %w", err)
+	}
+	l.entries = append(l.entries, entries...)
 	return nil
 }
 
@@ -109,7 +126,7 @@ func (l *Log) GetEntriesFrom(index int) []LogEntry {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
 
-	if index >= len(l.entries) {
+	if index < 0 || index >= len(l.entries) {
 		return nil
 	}
 	result := make([]LogEntry, len(l.entries)-index)
@@ -127,24 +144,60 @@ func (l *Log) TruncateFrom(index int) error {
 		return nil
 	}
 
-	l.entries = l.entries[:index]
+	entries := append([]LogEntry(nil), l.entries[:index]...)
 
-	// Rewrite the file from scratch with only the surviving entries.
-	// This works on Windows because we are not using O_APPEND.
-	if err := l.file.Truncate(0); err != nil {
-		return fmt.Errorf("truncate file: %w", err)
+	var data bytes.Buffer
+	for _, entry := range entries[1:] { // skip dummy entry at index 0
+		encoded, err := json.Marshal(entry)
+		if err != nil {
+			return fmt.Errorf("marshal entry during rewrite: %w", err)
+		}
+		data.Write(encoded)
+		data.WriteByte('\n')
 	}
-	if _, err := l.file.Seek(0, io.SeekStart); err != nil {
-		return fmt.Errorf("seek after truncate: %w", err)
+
+	path := l.file.Name()
+	tempFile, err := os.CreateTemp(filepath.Dir(path), "raft-log-*.tmp")
+	if err != nil {
+		return fmt.Errorf("create temporary log file: %w", err)
 	}
-	for _, entry := range l.entries[1:] { // skip dummy entry at index 0
-		data, _ := json.Marshal(entry)
-		fmt.Fprintf(l.file, "%s\n", data)
+	tempPath := tempFile.Name()
+	defer os.Remove(tempPath)
+	if _, err := tempFile.Write(data.Bytes()); err != nil {
+		tempFile.Close()
+		return fmt.Errorf("rewrite temporary log file: %w", err)
 	}
-	// Move cursor to end so the next Append writes in the right place
-	if _, err := l.file.Seek(0, io.SeekEnd); err != nil {
-		return fmt.Errorf("seek to end after rewrite: %w", err)
+	if err := tempFile.Sync(); err != nil {
+		tempFile.Close()
+		return fmt.Errorf("sync rewritten log file: %w", err)
 	}
+	if err := tempFile.Close(); err != nil {
+		return fmt.Errorf("close temporary log file: %w", err)
+	}
+	if err := l.file.Close(); err != nil {
+		return fmt.Errorf("close old log file: %w", err)
+	}
+	if err := os.Rename(tempPath, path); err != nil {
+		l.reopen(path)
+		return fmt.Errorf("replace log file: %w", err)
+	}
+	if err := l.reopen(path); err != nil {
+		return err
+	}
+	l.entries = entries
+	return nil
+}
+
+func (l *Log) reopen(path string) error {
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0644)
+	if err != nil {
+		return fmt.Errorf("reopen log file: %w", err)
+	}
+	if _, err := file.Seek(0, io.SeekEnd); err != nil {
+		file.Close()
+		return fmt.Errorf("seek to end after reopen: %w", err)
+	}
+	l.file = file
 	return nil
 }
 
@@ -171,5 +224,7 @@ func (l *Log) Length() int {
 
 // Close cleanly closes the underlying log file.
 func (l *Log) Close() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
 	return l.file.Close()
 }

@@ -2,7 +2,7 @@
 
 **Version 1.0.0 — Distributed systems project**
 
-A fault-tolerant, distributed key-value database built from scratch in **Go**. The cluster runs the **Raft consensus algorithm** — implemented entirely without external dependencies — to stay perfectly synchronised across all nodes and to automatically recover from failures with no data loss and no manual intervention.
+A fault-tolerant, distributed key-value database built from scratch in **Go**. The cluster runs the **Raft consensus algorithm** — implemented entirely without external dependencies — to replicate majority-committed writes durably and automatically recover from single-node failures.
 
 [![Go](https://img.shields.io/badge/Built%20With-Go-00ADD8?style=for-the-badge&logo=go&logoColor=white)](https://go.dev)
 [![Docker](https://img.shields.io/badge/Runs%20On-Docker-2496ED?style=for-the-badge&logo=docker&logoColor=white)](https://www.docker.com)
@@ -26,10 +26,10 @@ A fault-tolerant, distributed key-value database built from scratch in **Go**. T
 
 | Category | Description |
 |----------|-------------|
-| ⚡ **Consensus** | Full Raft implementation: leader election, log replication, and safety guarantees. Nodes elect a new leader automatically when the current one fails. |
+| ⚡ **Consensus** | Raft leader election, durable log replication, and majority commit. Nodes elect a new leader automatically when the current one fails. |
 | 📝 **Write-Ahead Log** | Every operation is written to disk before being applied to the state machine. Nodes replay the log on restart to recover their state exactly. |
 | 🔄 **Replication** | The leader replicates log entries to all followers via `AppendEntries` RPCs. Entries commit only after a cluster majority confirms receipt. |
-| 🛡️ **Fault Tolerance** | A 3-node cluster survives the loss of any single node. The two remaining nodes form a majority and keep serving reads and writes uninterrupted. |
+| 🛡️ **Fault Tolerance** | A 3-node cluster survives the loss of any single node. After leader re-election, the two remaining nodes form a majority and continue serving requests. |
 | 🗄️ **Key-Value Store** | In-memory state machine supporting `SET key value`, `GET key`, `DELETE key`, and `GET ALL` operations. |
 | 🌐 **REST API** | HTTP/JSON API for clients with endpoints for reading, writing, deleting, and inspecting cluster status. |
 | 💻 **CLI Client** | Terminal client for all API operations — get, set, delete, list all, and node status. |
@@ -48,8 +48,8 @@ A fault-tolerant, distributed key-value database built from scratch in **Go**. T
 ### 1. Clone the repository
 
 ```bash
-git clone https://github.com/Akiyoshi02/raft-kv-store.git
-cd raft-kv-store
+git clone https://github.com/Akiyoshi02/Raft_KV_Store.git
+cd Raft_KV_Store
 ```
 
 ### 2. Build the CLI client
@@ -127,7 +127,7 @@ docker start raft-node1
 
 ## 📬 REST API
 
-All requests and responses use JSON. Write operations (`PUT`, `DELETE`) must be sent to the **leader node**. Read operations (`GET`) can be sent to any node.
+All requests and responses use JSON. Write operations (`PUT`, `DELETE`) must be sent to the **leader node**. Read operations (`GET`) can be sent to any node, but reads are local and may briefly be stale while replication or recovery is in progress.
 
 ### Client endpoints
 
@@ -161,7 +161,7 @@ All requests and responses use JSON. Write operations (`PUT`, `DELETE`) must be 
 ## 📂 Project Structure
 
 ```
-raft-kv-store/
+Raft_KV_Store/
 ├── cmd/
 │   ├── server/
 │   │   └── main.go          Entry point — wires all components together
@@ -246,4 +246,4 @@ This repository is an **open portfolio project** demonstrating distributed syste
 
 ---
 
-_Updated: 2026-05-28_
+_Updated: 2026-06-01_

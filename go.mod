@@ -1,3 +1,3 @@
-module github.com/Akiyoshi02/raft-kv-store
+module github.com/Akiyoshi02/Raft_KV_Store
 
-go 1.26.3
+go 1.22
